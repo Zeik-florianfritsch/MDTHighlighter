@@ -1,0 +1,25 @@
+﻿## Interface: 120001
+## Version: @project-version@
+## Title: MDT Highlighter
+## Notes: Surligne les nameplates ennemis selon ta route MDT - pull actuel (tank), prochain pull, mobs skipped. Fonctionne en M0, M+, Heroic, Normal.
+## Author: YourName
+## X-License: MIT
+## X-Category: Raid
+## X-Curse-Project-ID: 0
+## X-Wago-ID: 0
+## SavedVariables: MDTHighlighterDB
+
+## OptionalDeps: MythicDungeonTools
+
+# Librairies
+Libs\LibStub\LibStub.lua
+Libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
+Libs\LibCustomGlow\LibCustomGlow.lua
+
+# Core
+MDTHighlighter.lua
+
+# Modules
+Modules\Config.lua
+Modules\MDTBridge.lua
+Modules\NameplateManager.lua
