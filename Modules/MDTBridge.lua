@@ -1,158 +1,141 @@
-﻿-- Modules/MDTBridge.lua
--- Interface avec MythicDungeonTools pour extraire les pulls.
--- Fonctionne en Mythic+, Mythic 0 (MM0), Heroic, Normal.
--- Aucune restriction de difficulte : utile pour tester hors cle.
+-- Modules/MDTBridge.lua
 
----@class MDTBridgeModule
 MDTHighlighter.MDTBridge = {}
 local Bridge = MDTHighlighter.MDTBridge
 
--- ─────────────────────────────────────────────────────────────
--- Etat interne
--- ─────────────────────────────────────────────────────────────
+Bridge.currentPullNPCs   = {}
+Bridge.currentPullNames  = {}
+Bridge.nextPullNPCs      = {}
+Bridge.nextPullNames     = {}
+Bridge.skipNPCs          = {}
+Bridge.skipNames         = {}
+Bridge._lastPullIndex    = nil
+Bridge._ticker           = nil
+Bridge.TICK_INTERVAL     = 0.5
 
-Bridge.currentPullNPCs = {}
-Bridge.nextPullNPCs    = {}
-Bridge.skipNPCs        = {}
-
-Bridge._lastPullIndex  = nil
-Bridge._ticker         = nil
-Bridge.TICK_INTERVAL   = 1.0
-
--- ─────────────────────────────────────────────────────────────
--- Verification de disponibilite MDT
--- ─────────────────────────────────────────────────────────────
-
-function Bridge:IsReady()
-    return MDT ~= nil
-        and MDT.db ~= nil
-        and MDT.db.profile ~= nil
-        and MDT.db.profile.pulls ~= nil
+local function GetMDTDB()
+    local api = _G.MythicDungeonToolsAPI
+    if api and type(api.GetDB) == "function" then
+        local ok, db = pcall(function() return api:GetDB() end)
+        if ok and db then return db end
+    end
+    local sv = _G["MythicDungeonToolsDB"]
+    if sv and sv.global then return sv.global end
+    return nil
 end
 
--- Retourne l index du pull actif (1-based) ou nil
-function Bridge:GetCurrentPullIndex()
-    if not Bridge:IsReady() then return nil end
-    local pullIndex = MDT.db.profile.pull
-    if type(pullIndex) == "number" and pullIndex >= 1 then
-        return pullIndex
+local function GetCurrentDungeonIdx()
+    local db = GetMDTDB()
+    return db and db.currentDungeonIdx or nil
+end
+
+local function GetCurrentPreset()
+    local db = GetMDTDB()
+    local didx = GetCurrentDungeonIdx()
+    if not db or not didx then return nil end
+    if not db.presets or not db.presets[didx] then return nil end
+    local pidx = (db.currentPreset and db.currentPreset[didx]) or 1
+    return db.presets[didx][pidx]
+end
+
+local function GetCurrentPullIndex()
+    local preset = GetCurrentPreset()
+    if not preset or not preset.value then return nil end
+    local sel = preset.value.selection
+    if sel and #sel > 0 then return sel[#sel] end
+    if preset.value.currentPull and preset.value.currentPull > 0 then
+        return preset.value.currentPull
     end
     return nil
 end
 
--- Retourne le nombre total de pulls dans la route chargee
-function Bridge:GetTotalPulls()
-    if not Bridge:IsReady() then return 0 end
-    local pulls = MDT.db.profile.pulls
-    if type(pulls) ~= "table" then return 0 end
-    return #pulls
+local function GetTotalPullsCount()
+    local preset = GetCurrentPreset()
+    if preset and preset.value and preset.value.pulls then
+        return #preset.value.pulls
+    end
+    return 0
 end
 
--- Collecte les NPC IDs d un pull donne. Renvoie { [npcID] = true }
--- Fonctionne peu importe la difficulte du donjon (M0, M+, Heroic...)
-function Bridge:GetNPCsInPull(pullIndex)
-    local set = {}
-    if not Bridge:IsReady() then return set end
-    if type(pullIndex) ~= "number" or pullIndex < 1 then return set end
+local function GetDungeonEnemies()
+    local api = _G.MythicDungeonToolsAPI
+    if api and type(api.dungeonEnemies) == "table" then
+        return api.dungeonEnemies
+    end
+    return nil
+end
 
-    local pulls        = MDT.db.profile.pulls
-    local dungeonIndex = MDT:GetCurrentDungeonIdx()
-    if not pulls or not dungeonIndex then return set end
+local function ExtractPullDataFromDB(pullIndex)
+    local ids, names = {}, {}
+    local preset = GetCurrentPreset()
+    if not preset or not preset.value or not preset.value.pulls then return ids, names end
+    local pull = preset.value.pulls[pullIndex]
+    if not pull then return ids, names end
 
-    local pull = pulls[pullIndex]
-    if not pull then return set end
+    local dungeonIdx = GetCurrentDungeonIdx()
+    local de = GetDungeonEnemies()
+    if not de or not dungeonIdx or not de[dungeonIdx] then return ids, names end
+    local dungeon = de[dungeonIdx]
 
-    -- MDT stocke les enemies du donjon dans MDT.dungeonEnemies[dungeonIndex]
-    -- La cle dungeonIndex dans le pull correspond aux clones (positions) de chaque enemy
-    local dungeonEnemies = MDT.dungeonEnemies and MDT.dungeonEnemies[dungeonIndex]
-    if not dungeonEnemies then return set end
-
-    local dungeonPull = pull[dungeonIndex]
-    if not dungeonPull then return set end
-
-    for cloneIndex, count in pairs(dungeonPull) do
-        if type(count) == "number" and count > 0 then
-            local enemy = dungeonEnemies[cloneIndex]
-            if enemy and enemy.id then
-                set[enemy.id] = true
+    for enemyIdxStr, clones in pairs(pull) do
+        local enemyIdx = tonumber(enemyIdxStr)
+        if enemyIdx then
+            local enemy = dungeon[enemyIdx]
+            if enemy and type(clones) == "table" then
+                local hasClone = false
+                for _, cloneIdx in pairs(clones) do
+                    if enemy.clones and enemy.clones[cloneIdx] then
+                        hasClone = true; break
+                    end
+                end
+                if hasClone then
+                    if enemy.id   then ids[enemy.id]     = true end
+                    if enemy.name then names[enemy.name] = true end
+                end
             end
         end
     end
-    return set
+    return ids, names
 end
 
--- Collecte les NPCs presents dans les donnees du donjon mais absents de tous les pulls
-function Bridge:GetSkippedNPCs(allPullNPCs)
-    local set = {}
-    if not Bridge:IsReady() then return set end
-
-    local dungeonIndex   = MDT:GetCurrentDungeonIdx()
-    local dungeonEnemies = dungeonIndex and MDT.dungeonEnemies and MDT.dungeonEnemies[dungeonIndex]
-    if not dungeonEnemies then return set end
-
-    for _, enemy in ipairs(dungeonEnemies) do
-        -- Ne inclure que les enemies qui comptent vraiment (pas les bosses en dehors de la route, etc.)
-        if enemy and enemy.id and not allPullNPCs[enemy.id] then
-            -- Exclure les enemies marques comme non-comptables si MDT le precise
-            local isSub = (enemy.sublevel ~= nil) -- toujours inclure meme les enemies de sous-niveau
-            set[enemy.id] = true
+local function ExtractPullDataFromUI(pullIndex)
+    local ids, names = {}, {}
+    local sidePanel = _G.MDTFrame and _G.MDTFrame.sidePanel
+    if not sidePanel or not sidePanel.newPullButtons then return ids, names end
+    local btn = sidePanel.newPullButtons[pullIndex]
+    if not btn or not btn.enemyPortraits then return ids, names end
+    for i = 1, 7 do
+        local portrait = btn.enemyPortraits[i]
+        if portrait and portrait.enemyData then
+            local d = portrait.enemyData
+            if d.npcId then ids[d.npcId] = true end
+            if d.name  then names[d.name] = true end
         end
     end
-    return set
+    return ids, names
 end
 
--- Rafraichissement principal : recalcule les 3 sets et notifie NameplateManager
-function Bridge:Refresh()
-    if not MDTHighlighter.db or not MDTHighlighter.db.enabled then return end
-
-    if not Bridge:IsReady() then
-        if next(Bridge.currentPullNPCs) or next(Bridge.nextPullNPCs) or next(Bridge.skipNPCs) then
-            Bridge.currentPullNPCs = {}
-            Bridge.nextPullNPCs    = {}
-            Bridge.skipNPCs        = {}
-            MDTHighlighter.NameplateManager:OnRouteChanged()
-        end
-        return
+local function ExtractPullData(pullIndex)
+    local de = GetDungeonEnemies()
+    local didx = GetCurrentDungeonIdx()
+    if de and didx and de[didx] then
+        return ExtractPullDataFromDB(pullIndex)
     end
-
-    local currentIndex = Bridge:GetCurrentPullIndex()
-    if currentIndex == Bridge._lastPullIndex then return end
-    Bridge._lastPullIndex = currentIndex
-
-    local allPulled = {}
-    local totalPulls = Bridge:GetTotalPulls()
-
-    -- Pull actuel
-    Bridge.currentPullNPCs = {}
-    if currentIndex and MDTHighlighter.db.showCurrent then
-        Bridge.currentPullNPCs = Bridge:GetNPCsInPull(currentIndex)
-        for id in pairs(Bridge.currentPullNPCs) do allPulled[id] = true end
-    end
-
-    -- Pull suivant
-    Bridge.nextPullNPCs = {}
-    if currentIndex and currentIndex < totalPulls and MDTHighlighter.db.showNext then
-        Bridge.nextPullNPCs = Bridge:GetNPCsInPull(currentIndex + 1)
-        for id in pairs(Bridge.nextPullNPCs) do allPulled[id] = true end
-    end
-
-    -- Tous les pulls pour calculer les skips
-    for i = 1, totalPulls do
-        local npcs = Bridge:GetNPCsInPull(i)
-        for id in pairs(npcs) do allPulled[id] = true end
-    end
-
-    -- Mobs skipped
-    Bridge.skipNPCs = {}
-    if MDTHighlighter.db.showSkip then
-        Bridge.skipNPCs = Bridge:GetSkippedNPCs(allPulled)
-    end
-
-    MDTHighlighter.NameplateManager:OnRouteChanged()
+    return ExtractPullDataFromUI(pullIndex)
 end
 
--- Retourne la categorie de highlight pour un NPC ID, ou nil
--- Priorite : CURRENT > NEXT > SKIP
+function Bridge:IsReady()
+    return GetTotalPullsCount() > 0
+end
+
+function Bridge:GetCurrentPullIndex()
+    return GetCurrentPullIndex()
+end
+
+function Bridge:GetTotalPulls()
+    return GetTotalPullsCount()
+end
+
 function Bridge:GetHighlightForNPC(npcID)
     if Bridge.currentPullNPCs[npcID] then return "CURRENT" end
     if Bridge.nextPullNPCs[npcID]    then return "NEXT"    end
@@ -160,33 +143,171 @@ function Bridge:GetHighlightForNPC(npcID)
     return nil
 end
 
--- Force un rafraichissement immediat (utile apres /mdth test ou /mdth force)
+function Bridge:GetHighlightForName(name)
+    if not name then return nil end
+    if Bridge.currentPullNames[name] then return "CURRENT" end
+    if Bridge.nextPullNames[name]    then return "NEXT"    end
+    if Bridge.skipNames[name]        then return "SKIP"    end
+    return nil
+end
+
+local function DoRefresh()
+    if not MDTHighlighter.db or not MDTHighlighter.db.enabled then return end
+    if not Bridge:IsReady() then
+        Bridge.currentPullNPCs, Bridge.currentPullNames = {}, {}
+        Bridge.nextPullNPCs, Bridge.nextPullNames = {}, {}
+        Bridge.skipNPCs, Bridge.skipNames = {}, {}
+        MDTHighlighter.NameplateManager:OnRouteChanged()
+        return
+    end
+
+    local currentIndex = Bridge:GetCurrentPullIndex()
+    if currentIndex == Bridge._lastPullIndex then return end
+    Bridge._lastPullIndex = currentIndex
+
+    local totalPulls = Bridge:GetTotalPulls()
+    local allNPCs, allNames = {}, {}
+
+    Bridge.currentPullNPCs, Bridge.currentPullNames = {}, {}
+    if currentIndex and MDTHighlighter.db.showCurrent then
+        Bridge.currentPullNPCs, Bridge.currentPullNames = ExtractPullData(currentIndex)
+        for id in pairs(Bridge.currentPullNPCs)  do allNPCs[id]  = true end
+        for nm in pairs(Bridge.currentPullNames) do allNames[nm] = true end
+    end
+
+    Bridge.nextPullNPCs, Bridge.nextPullNames = {}, {}
+    if currentIndex and currentIndex < totalPulls and MDTHighlighter.db.showNext then
+        Bridge.nextPullNPCs, Bridge.nextPullNames = ExtractPullData(currentIndex + 1)
+        for id in pairs(Bridge.nextPullNPCs)  do allNPCs[id]  = true end
+        for nm in pairs(Bridge.nextPullNames) do allNames[nm] = true end
+    end
+
+    Bridge.skipNPCs, Bridge.skipNames = {}, {}
+    if MDTHighlighter.db.showSkip then
+        for i = 1, totalPulls do
+            if i ~= currentIndex and (not currentIndex or i ~= currentIndex + 1) then
+                local ids, names = ExtractPullData(i)
+                for id in pairs(ids)   do if not allNPCs[id]  then Bridge.skipNPCs[id]  = true end end
+                for nm in pairs(names) do if not allNames[nm] then Bridge.skipNames[nm] = true end end
+            end
+        end
+    end
+
+    MDTHighlighter.NameplateManager:OnRouteChanged()
+end
+
+function Bridge:Refresh()
+    DoRefresh()
+end
+
 function Bridge:ForceRefresh()
-    Bridge._lastPullIndex = nil  -- invalide le cache pour forcer le recalcul
-    Bridge:Refresh()
+    Bridge._lastPullIndex = nil
+    DoRefresh()
+end
+
+function Bridge:DebugDump()
+    MDTHighlighter:Print("=== MDTBridge Debug ===")
+    local db = GetMDTDB()
+    MDTHighlighter:Print("MDT DB: " .. (db and "|cff00ff00OK|r" or "|cffff0000nil|r"))
+    local didx = GetCurrentDungeonIdx()
+    MDTHighlighter:Print("Dungeon idx: " .. tostring(didx))
+
+    local preset = GetCurrentPreset()
+    if preset and preset.value then
+        local pulls = preset.value.pulls
+        local sel = preset.value.selection
+        MDTHighlighter:Print("Pulls: #" .. (pulls and #pulls or 0) ..
+            " selection=" .. (sel and table.concat(sel, ",") or "nil"))
+    else
+        MDTHighlighter:Print("|cffff0000Preset: nil|r")
+    end
+
+    local de = GetDungeonEnemies()
+    local hasDE = de and didx and de[didx]
+    local hasUI = _G.MDTFrame and _G.MDTFrame.sidePanel and _G.MDTFrame.sidePanel.newPullButtons
+    MDTHighlighter:Print("dungeonEnemies: " .. (hasDE and "|cff00ff00OK|r" or "|cffff0000nil|r") ..
+        "  UI Buttons: " .. (hasUI and "|cff00ff00Yes|r" or "|cffff0000No|r"))
+
+    local cidx = GetCurrentPullIndex()
+    MDTHighlighter:Print("Current pull idx: " .. tostring(cidx))
+    if cidx then
+        local ids, names = ExtractPullData(cidx)
+        local idList, nameList = {}, {}
+        for id in pairs(ids)   do idList[#idList+1]     = id end
+        for nm in pairs(names) do nameList[#nameList+1] = nm end
+        MDTHighlighter:Print("Pull " .. cidx .. ": " .. #idList .. " NPCs IDs, noms=(" ..
+            table.concat(nameList, ", ") .. ")")
+    end
+
+    -- Diagnostic nameplates
+    local NM = MDTHighlighter.NameplateManager
+    MDTHighlighter:Print("--- Nameplates ---")
+    MDTHighlighter:Print("NM._plates: " .. (function() local n=0; for _ in pairs(NM._plates) do n=n+1 end; return n end)() ..
+        "  events: " .. tostring(NM._addCount or 0))
+
+    -- Compter les plates via GetNamePlates (pairs, pas ipairs)
+    local plateCount = 0
+    local allPlates = C_NamePlate.GetNamePlates()
+    for _ in pairs(allPlates) do plateCount = plateCount + 1 end
+    MDTHighlighter:Print("C_NamePlate.GetNamePlates(): " .. plateCount .. " plates")
+
+    local issecret = _G.issecretvalue or function() return false end
+    local shown = 0
+    for _, np in pairs(allPlates) do
+        local token = np.namePlateUnitToken
+        if token then
+            shown = shown + 1
+            local name = UnitName(token) or "?"
+            local guid  = UnitGUID(token)
+            local sec = false
+            if guid then local ok, r = pcall(issecret, guid); sec = ok and r end
+            local npcID = nil
+            if guid and not sec then
+                local ok, _, _, _, _, _, nid = pcall(strsplit, "-", guid)
+                if ok then npcID = tonumber(nid) end
+            end
+            MDTHighlighter:Print(string.format("  [%d] %s | npcID=%s | secret=%s | friend=%s",
+                shown, name, tostring(npcID), tostring(sec),
+                tostring(UnitIsFriend("player", token))))
+            if shown >= 4 then MDTHighlighter:Print("  ..."); break end
+        end
+    end
+    if shown == 0 then
+        MDTHighlighter:Print("  (0 nameplates avec token valide)")
+    end
+
+    -- Cibler une plate directement via target
+    if UnitExists("target") and not UnitIsFriend("player", "target") then
+        local guid = UnitGUID("target")
+        local sec = false
+        if guid then local ok, r = pcall(issecret, guid); sec = ok and r end
+        local npcID = nil
+        if guid and not sec then
+            local ok, _, _, _, _, _, nid = pcall(strsplit, "-", guid)
+            if ok then npcID = tonumber(nid) end
+        end
+        MDTHighlighter:Print("TARGET: " .. (UnitName("target") or "?") ..
+            " npcID=" .. tostring(npcID) ..
+            " secret=" .. tostring(sec) ..
+            " highlight=" .. tostring(Bridge:GetHighlightForNPC(npcID or 0)))
+    end
 end
 
 function Bridge:Initialize()
-    -- Ticker de 1s : suffisant pour detecter les changements de pull dans MDT
-    -- Fonctionne en toute difficulte (M0, M+, Heroic, Normal)
+    -- Charger MythicDungeonTools_UI silencieusement (sans ouvrir la fenetre)
+    -- Cela peuple dungeonEnemies qui est necessaire pour matcher les NPCs
+    C_Timer.After(0.5, function()
+        if C_AddOns.IsAddOnLoaded("MythicDungeonTools") and
+           not C_AddOns.IsAddOnLoaded("MythicDungeonTools_UI") then
+            C_AddOns.LoadAddOn("MythicDungeonTools_UI")
+        end
+    end)
+
+    C_Timer.After(1.5, function()
+        Bridge:ForceRefresh()
+    end)
+
     Bridge._ticker = C_Timer.NewTicker(Bridge.TICK_INTERVAL, function()
         Bridge:Refresh()
     end)
-
-    -- Hook sur MDT quand il est disponible pour detecter les changements de route importee
-    if MDT then
-        -- On hook la fonction d importation de route de MDT
-        -- afin de forcer un rafraichissement immediat sans attendre le ticker
-        if MDT.ImportStringToTable then
-            hooksecurefunc(MDT, "ImportStringToTable", function()
-                C_Timer.After(0.5, function() Bridge:ForceRefresh() end)
-            end)
-        end
-        -- Hook sur le changement de pull actif dans l UI de MDT
-        if MDT.UpdatePull then
-            hooksecurefunc(MDT, "UpdatePull", function()
-                Bridge:ForceRefresh()
-            end)
-        end
-    end
 end

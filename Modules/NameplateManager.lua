@@ -1,134 +1,175 @@
-﻿-- Modules/NameplateManager.lua
--- Gere les nameplates visibles et applique les glows LibCustomGlow.
--- Fonctionne en toute difficulte (M0, M+, Heroic, Normal).
+-- Modules/NameplateManager.lua
+-- Midnight M+: GUIDs secrets → matching par npcID impossible directement.
+-- Solution: cache npcID→nom (construit hors M+) + indicateur DIALOG strata.
 
----@class NameplateManagerModule
 MDTHighlighter.NameplateManager = {}
 local NM = MDTHighlighter.NameplateManager
+NM._plates    = {}
+NM._addCount  = 0
 
-NM._plates  = {}  -- unitToken -> { frame, glowFrame, npcID }
-local GLOW_KEY = "MDTHighlighter"
+local issecret = _G.issecretvalue or function() return false end
 
--- ─────────────────────────────────────────────────────────────
--- Utilitaires
--- ─────────────────────────────────────────────────────────────
-
--- Extrait le NPC ID numerique depuis un GUID Creature/Vehicle
--- Format GUID : "Creature-0-XXXX-XXXX-XXXX-NPCID-XXXX"
 local function GUIDToNPCID(guid)
     if not guid then return nil end
-    local unitType, _, _, _, _, npcID = strsplit("-", guid)
-    if unitType == "Creature" or unitType == "Vehicle" then
+    local ok, r = pcall(issecret, guid)
+    if ok and r then return nil end
+    local ok2, unitType, _, _, _, _, npcID = pcall(strsplit, "-", guid)
+    if ok2 and (unitType == "Creature" or unitType == "Vehicle") then
         return tonumber(npcID)
     end
     return nil
 end
 
--- Retourne le frame cible pour le glow (UnitFrame du nameplate)
-local function GetGlowFrame(nameplate)
-    if nameplate and nameplate.UnitFrame then
-        return nameplate.UnitFrame
+local function GetLocaleCache()
+    if not MDTHighlighter.db then return {} end
+    if not MDTHighlighter.db.nameCache then
+        MDTHighlighter.db.nameCache = {}
     end
-    return nameplate
+    return MDTHighlighter.db.nameCache
 end
 
--- ─────────────────────────────────────────────────────────────
--- Application du glow
--- ─────────────────────────────────────────────────────────────
-
-local function ApplyGlow(frame, colorKey)
-    local LCG = LibStub and LibStub("LibCustomGlow-1.0", true)
-    if not LCG then return end
-    local c  = MDTHighlighter.COLORS[colorKey]
-    local db = MDTHighlighter.db
-    LCG.PixelGlow_Stop(frame, GLOW_KEY)
-    LCG.PixelGlow_Start(
-        frame,
-        { c.r, c.g, c.b, c.a },
-        db.glowLines      or 8,
-        db.glowFrequency  or 0.25,
-        db.glowThickness  or 2,
-        0, 0, false,
-        GLOW_KEY
-    )
+-- Indicateur colore sous la nameplate
+local function CreateIndicator(nameplate)
+    local f = CreateFrame("Frame", nil, nameplate, "BackdropTemplate")
+    f:SetFrameStrata("DIALOG")
+    f:SetFrameLevel(128)
+    f:SetSize(60, 6)
+    f:SetPoint("TOP", nameplate, "BOTTOM", 0, -3)
+    f:SetBackdrop({
+        bgFile   = "Interface\\ChatFrame\\ChatFrameBackground",
+        edgeFile = "Interface\\ChatFrame\\ChatFrameBackground",
+        edgeSize = 1,
+    })
+    f:SetBackdropColor(0, 0, 0, 0)
+    f:SetBackdropBorderColor(0, 0, 0, 0)
+    f:Hide()
+    return f
 end
 
-local function RemoveGlow(frame)
-    local LCG = LibStub and LibStub("LibCustomGlow-1.0", true)
-    if LCG then LCG.PixelGlow_Stop(frame, GLOW_KEY) end
+function NM:ApplyGlow(unitToken, highlightType)
+    local data = NM._plates[unitToken]
+    if not data or not data.indicator then return end
+
+    if highlightType and MDTHighlighter.db and MDTHighlighter.db.enabled then
+        local color = MDTHighlighter.COLORS[highlightType]
+        if color then
+            data.indicator:SetBackdropColor(color.r, color.g, color.b, color.a)
+            data.indicator:SetBackdropBorderColor(
+                math.min(1, color.r + 0.3),
+                math.min(1, color.g + 0.3),
+                math.min(1, color.b + 0.3), 1)
+            data.indicator:Show()
+            return
+        end
+    end
+    data.indicator:Hide()
 end
 
--- ─────────────────────────────────────────────────────────────
--- Mise a jour d un nameplate individuel
--- ─────────────────────────────────────────────────────────────
+function NM:UpdateNameplate(unitToken)
+    local data = NM._plates[unitToken]
+    if not data then return end
 
-local function UpdatePlate(unitToken)
-    local entry = NM._plates[unitToken]
-    if not entry then return end
-    local db = MDTHighlighter.db
-    if not db or not db.enabled then
-        RemoveGlow(entry.glowFrame)
+    -- Ignorer les allies
+    if UnitIsFriend("player", unitToken) then
+        NM:ApplyGlow(unitToken, nil)
         return
     end
-    local highlight = MDTHighlighter.MDTBridge:GetHighlightForNPC(entry.npcID)
-    if not highlight
-        or (highlight == "CURRENT" and not db.showCurrent)
-        or (highlight == "NEXT"    and not db.showNext)
-        or (highlight == "SKIP"    and not db.showSkip)
-    then
-        RemoveGlow(entry.glowFrame)
-        return
+
+    local bridge = MDTHighlighter.MDTBridge
+    local highlight = nil
+
+    -- 1) Essai direct par NPC ID (fonctionne hors M+)
+    if data.npcID then
+        highlight = bridge:GetHighlightForNPC(data.npcID)
     end
-    ApplyGlow(entry.glowFrame, highlight)
+
+    -- 2) Cache locale: chercher le npcID pour ce nom localise
+    if not highlight and data.name then
+        local cache = GetLocaleCache()
+        local cachedNpcID = cache[data.name]
+        if cachedNpcID then
+            highlight = bridge:GetHighlightForNPC(cachedNpcID)
+        end
+    end
+
+    -- 3) Fallback par nom anglais (si par hasard MDT est en anglais aussi)
+    if not highlight and data.name then
+        highlight = bridge:GetHighlightForName(data.name)
+    end
+
+    NM:ApplyGlow(unitToken, highlight)
 end
 
--- ─────────────────────────────────────────────────────────────
--- API publique
--- ─────────────────────────────────────────────────────────────
-
--- Appele par MDTBridge quand les pulls changent
-function NM:OnRouteChanged()
-    for unitToken in pairs(NM._plates) do
-        UpdatePlate(unitToken)
-    end
-end
-
--- Appele par Config apres un toggle
 function NM:RefreshAll()
-    NM:OnRouteChanged()
+    for unitToken in pairs(NM._plates) do
+        NM:UpdateNameplate(unitToken)
+    end
 end
+
+function NM:OnRouteChanged()
+    NM:RefreshAll()
+end
+
+function NM:OnNamePlateAdded(unitToken)
+    NM._addCount = NM._addCount + 1
+    local nameplate = C_NamePlate.GetNamePlateForUnit(unitToken)
+    if not nameplate then return end
+
+    local guid  = UnitGUID(unitToken)
+    local npcID = GUIDToNPCID(guid)
+    local name  = UnitName(unitToken)
+
+    -- Construire le cache localise quand le GUID n'est pas secret (M0, monde)
+    if npcID and name then
+        local cache = GetLocaleCache()
+        if not cache[name] then
+            cache[name] = npcID
+        end
+    end
+
+    local indicator = CreateIndicator(nameplate)
+
+    NM._plates[unitToken] = {
+        indicator = indicator,
+        npcID     = npcID,
+        name      = name,
+    }
+
+    NM:UpdateNameplate(unitToken)
+end
+
+function NM:OnNamePlateRemoved(unitToken)
+    local data = NM._plates[unitToken]
+    if data then
+        if data.indicator then
+            data.indicator:Hide()
+            data.indicator:SetParent(nil)
+        end
+        NM._plates[unitToken] = nil
+    end
+end
+
+function NM:ForceGlowAll(highlightType)
+    -- Pour tester le rendu (testglow)
+    for unitToken, data in pairs(NM._plates) do
+        NM:ApplyGlow(unitToken, highlightType)
+    end
+end
+
+local eventFrame = CreateFrame("Frame")
+eventFrame:RegisterEvent("NAME_PLATE_UNIT_ADDED")
+eventFrame:RegisterEvent("NAME_PLATE_UNIT_REMOVED")
+eventFrame:SetScript("OnEvent", function(_, event, unitToken)
+    if event == "NAME_PLATE_UNIT_ADDED" then
+        NM:OnNamePlateAdded(unitToken)
+    elseif event == "NAME_PLATE_UNIT_REMOVED" then
+        NM:OnNamePlateRemoved(unitToken)
+    end
+end)
 
 function NM:Initialize()
-    local frame = CreateFrame("Frame")
-    frame:RegisterEvent("NAME_PLATE_UNIT_ADDED")
-    frame:RegisterEvent("NAME_PLATE_UNIT_REMOVED")
-    frame:RegisterEvent("PLAYER_ENTERING_WORLD")
-    frame:SetScript("OnEvent", function(_, event, unitToken)
-
-        if event == "NAME_PLATE_UNIT_ADDED" then
-            local nameplate = C_NamePlate.GetNamePlateForUnit(unitToken)
-            if not nameplate then return end
-            local guid  = UnitGUID(unitToken)
-            local npcID = GUIDToNPCID(guid)
-            if not npcID then return end
-            NM._plates[unitToken] = {
-                frame     = nameplate,
-                glowFrame = GetGlowFrame(nameplate),
-                npcID     = npcID,
-            }
-            UpdatePlate(unitToken)
-
-        elseif event == "NAME_PLATE_UNIT_REMOVED" then
-            local entry = NM._plates[unitToken]
-            if entry then
-                RemoveGlow(entry.glowFrame)
-                NM._plates[unitToken] = nil
-            end
-
-        elseif event == "PLAYER_ENTERING_WORLD" then
-            -- Nettoie les entrees perimees lors d un changement de zone
-            -- (fonctionne pour passage M0->M+, M+->M0, changement de donjon, etc.)
-            NM._plates = {}
-        end
-    end)
+    for _, nameplate in pairs(C_NamePlate.GetNamePlates()) do
+        local unit = nameplate.namePlateUnitToken
+        if unit then NM:OnNamePlateAdded(unit) end
+    end
 end

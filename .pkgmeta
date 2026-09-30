@@ -1,4 +1,4 @@
-﻿externals:
+externals:
   Libs/LibStub:
     url: https://repos.wowace.com/wow/libs/libstub/trunk
     tag: latest
